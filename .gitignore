@@ -1,0 +1,13 @@
+# This repository intentionally publishes only the runtime source and its
+# direct text/binary dependencies. Everything else in the working directory
+# (documents, outputs, caches, virtual environments and local tooling) stays
+# private by default.
+*
+
+!.gitignore
+!README.md
+!requirements_htr.txt
+!well_extraction_prompt.txt
+
+!historical_russian_htr_pipeline.py
+!hybrid_htr_table_pipeline.py
