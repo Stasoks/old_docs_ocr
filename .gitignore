@@ -11,3 +11,7 @@
 
 !historical_russian_htr_pipeline.py
 !hybrid_htr_table_pipeline.py
+!convert_rfdetr_to_safetensors.py
+!strip_ocr_for_llm.py
+!json_to_well_pdf.py
+!streamlit_app.py

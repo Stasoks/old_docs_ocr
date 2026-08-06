@@ -39,6 +39,7 @@ from typing import Any, Sequence
 from PIL import Image, ImageDraw
 
 import historical_russian_htr_pipeline as htr
+from strip_ocr_for_llm import clean_document
 
 DEFAULT_OCR_MODEL = "Kansallisarkisto/cyrillic-large-handwritten"
 DEFAULT_QWEN_MODEL = "qwen/qwen3-vl-4b"
@@ -589,91 +590,27 @@ def _json_from_text(content: Any) -> dict[str, Any] | None:
 def clean_document_for_extraction(
     document: dict[str, Any],
 ) -> dict[str, Any]:
-    """Keep only OCR content needed by the document-level extractor."""
+    """Keep only file/page plus block type/content for the final LLM."""
 
-    source_value = str(document.get("source_file", "")).strip()
-    source_file = Path(source_value).name if source_value else ""
-    cleaned_pages: list[dict[str, Any]] = []
-
-    raw_pages = document.get("pages", [])
-    if not isinstance(raw_pages, list):
-        raw_pages = []
-    for raw_page in raw_pages:
-        if not isinstance(raw_page, dict):
-            continue
-        try:
-            page_number = int(raw_page.get("page"))
-        except (TypeError, ValueError):
-            continue
-
-        cleaned_blocks: list[dict[str, Any]] = []
-        raw_blocks = raw_page.get("blocks", [])
-        if not isinstance(raw_blocks, list):
-            raw_blocks = []
-        for raw_block in raw_blocks:
-            if not isinstance(raw_block, dict):
-                continue
-            raw_type = str(raw_block.get("type", "text")).strip().lower()
-            block_type = (
-                raw_type
-                if raw_type in {"text", "title", "subtitle", "table"}
-                else "text"
-            )
-
-            content_value = raw_block.get("content", "")
-            if isinstance(content_value, list):
-                content = "\n".join(str(item) for item in content_value).strip()
-            else:
-                content = str(content_value or "").strip()
-
-            rows: list[list[str]] = []
-            raw_rows = raw_block.get("rows")
-            if block_type == "table" and isinstance(raw_rows, list):
-                for raw_row in raw_rows:
-                    if isinstance(raw_row, list):
-                        rows.append([str(cell).strip() for cell in raw_row])
-                    else:
-                        rows.append([str(raw_row).strip()])
-            if not content and rows:
-                content = "\n".join(" | ".join(row) for row in rows)
-            if not content and not rows:
-                continue
-
-            block: dict[str, Any] = {
-                "type": block_type,
-                "content": content,
-            }
-            if rows:
-                block["rows"] = rows
-            cleaned_blocks.append(block)
-
-        cleaned_page: dict[str, Any] = {
-            "page": page_number,
-            "blocks": cleaned_blocks,
-        }
-        page_source = str(raw_page.get("source_file") or "").strip()
-        if page_source:
-            cleaned_page["source_file"] = page_source
-        try:
-            source_page = int(raw_page.get("source_page"))
-        except (TypeError, ValueError):
-            source_page = 0
-        if source_page > 0:
-            cleaned_page["source_page"] = source_page
-        cleaned_pages.append(cleaned_page)
-
-    return {
-        "source_file": source_file,
-        "pages": cleaned_pages,
-    }
+    return clean_document(document)
 
 
 def load_well_extraction_prompt(path: Path) -> tuple[str, str]:
     text = path.expanduser().resolve().read_text(encoding="utf-8").strip()
     system_marker = "[SYSTEM]"
     user_marker = "[USER]"
+    if system_marker not in text and user_marker not in text:
+        if not text:
+            raise ValueError("Промпт экстракции пуст.")
+        return (
+            text,
+            "Извлеки параметры скважины из OCR JSON по системным правилам. "
+            "Сначала проанализируй весь документ, затем верни только JSON.",
+        )
     if system_marker not in text or user_marker not in text:
-        raise ValueError("Промпт экстракции должен содержать секции [SYSTEM] и [USER].")
+        raise ValueError(
+            "В промпте должны быть либо обе секции [SYSTEM]/[USER], либо ни одной."
+        )
     system_start = text.index(system_marker) + len(system_marker)
     user_start = text.index(user_marker, system_start)
     system_prompt = text[system_start:user_start].strip()
@@ -740,7 +677,24 @@ def well_extraction_response_format() -> dict[str, Any]:
                             "type": "object",
                             "properties": {
                                 "parameter": {"type": "string", "enum": parameters},
+                                "conflict_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "ocr_error",
+                                        "possible_document_inconsistency",
+                                        "possible_rounding",
+                                        "technical_stage_difference",
+                                        "temporal_change",
+                                        "unresolved",
+                                    ],
+                                },
                                 "raw_value": {"type": "string"},
+                                "file": {
+                                    "anyOf": [
+                                        {"type": "string"},
+                                        {"type": "null"},
+                                    ]
+                                },
                                 "page": {"type": "integer", "minimum": 1},
                                 "evidence": {
                                     "type": "string",
@@ -751,7 +705,9 @@ def well_extraction_response_format() -> dict[str, Any]:
                             },
                             "required": [
                                 "parameter",
+                                "conflict_type",
                                 "raw_value",
+                                "file",
                                 "page",
                                 "evidence",
                                 "reason",
@@ -784,8 +740,18 @@ def _normalized_literal(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
-def _page_search_texts(cleaned_document: dict[str, Any]) -> dict[int, list[str]]:
-    search_texts: dict[int, list[str]] = {}
+SourcePageKey = tuple[str, int]
+
+
+def _clean_file_name(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    return text.rsplit("/", 1)[-1] if text else ""
+
+
+def _page_search_texts(
+    cleaned_document: dict[str, Any],
+) -> dict[SourcePageKey, list[str]]:
+    fragments_by_page: dict[SourcePageKey, list[str]] = {}
     for page in cleaned_document.get("pages", []):
         if not isinstance(page, dict):
             continue
@@ -793,6 +759,8 @@ def _page_search_texts(cleaned_document: dict[str, Any]) -> dict[int, list[str]]
             page_number = int(page.get("page"))
         except (TypeError, ValueError):
             continue
+        source_file = _clean_file_name(page.get("file"))
+        page_key = (source_file, page_number)
         fragments: list[str] = []
         for block in page.get("blocks", []):
             if not isinstance(block, dict):
@@ -800,28 +768,47 @@ def _page_search_texts(cleaned_document: dict[str, Any]) -> dict[int, list[str]]
             content = str(block.get("content", "")).strip()
             if content:
                 fragments.append(content)
-            rows = block.get("rows")
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, list):
-                        fragments.append(" ".join(str(cell) for cell in row))
+        fragments_by_page.setdefault(page_key, []).extend(fragments)
+
+    search_texts: dict[SourcePageKey, list[str]] = {}
+    for page_key, fragments in fragments_by_page.items():
         whole_page = "\n".join(fragments)
         variants = [whole_page, whole_page.replace(" | ", " ")]
-        search_texts[page_number] = [
-            _normalized_literal(variant) for variant in variants
-        ]
+        search_texts[page_key] = [_normalized_literal(variant) for variant in variants]
     return search_texts
 
 
 def _literal_exists_on_page(
     value: str,
-    page_number: int,
-    search_texts: dict[int, list[str]],
+    page_key: SourcePageKey,
+    search_texts: dict[SourcePageKey, list[str]],
 ) -> bool:
     needle = _normalized_literal(value)
     return bool(needle) and any(
-        needle in haystack for haystack in search_texts.get(page_number, [])
+        needle in haystack for haystack in search_texts.get(page_key, [])
     )
+
+
+def _resolve_evidence_page(
+    source_file: Any,
+    page_number: int,
+    evidence: str,
+    search_texts: dict[SourcePageKey, list[str]],
+) -> SourcePageKey | None:
+    candidates = [key for key in search_texts if key[1] == page_number]
+    requested_file = _clean_file_name(source_file)
+    if requested_file:
+        file_candidates = [key for key in candidates if key[0] == requested_file]
+        if file_candidates:
+            candidates = file_candidates
+        elif len(candidates) != 1:
+            return None
+    matching = [
+        key
+        for key in candidates
+        if _literal_exists_on_page(evidence, key, search_texts)
+    ]
+    return matching[0] if len(matching) == 1 else None
 
 
 def sanitize_well_extraction(
@@ -835,19 +822,6 @@ def sanitize_well_extraction(
             raise ValueError(f"Qwen вернул некорректное поле {field_name}.")
 
     valid_parameters = set(CANONICAL_WELL_PARAMETERS)
-    source_file = str(cleaned_document.get("source_file", "")).strip()
-    expected_file: str | None = source_file or None
-    page_source_files: dict[int, str] = {}
-    for page in cleaned_document.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        try:
-            page_number = int(page.get("page"))
-        except (TypeError, ValueError):
-            continue
-        page_source = str(page.get("source_file") or "").strip()
-        if page_source:
-            page_source_files[page_number] = Path(page_source.replace("\\", "/")).name
     search_texts = _page_search_texts(cleaned_document)
     local_warnings: list[str] = []
     records: list[dict[str, Any]] = []
@@ -876,11 +850,16 @@ def sanitize_well_extraction(
                 f"Удалена запись records[{index}] с некорректным confidence."
             )
             continue
-        if len(evidence) > 300 or not _literal_exists_on_page(
-            evidence, page_number, search_texts
-        ):
+        page_key = _resolve_evidence_page(
+            raw_record.get("file"),
+            page_number,
+            evidence,
+            search_texts,
+        )
+        if len(evidence) > 300 or page_key is None:
             local_warnings.append(
-                f"Удалена запись records[{index}]: evidence не найдена на странице {page_number}."
+                f"Удалена запись records[{index}]: evidence не найдена "
+                f"однозначно для файла/страницы {page_number}."
             )
             continue
         if _normalized_literal(raw_value) not in _normalized_literal(evidence):
@@ -894,7 +873,7 @@ def sanitize_well_extraction(
                 "parameter": parameter,
                 "value": value,
                 "raw_value": raw_value,
-                "file": page_source_files.get(page_number, expected_file),
+                "file": page_key[0] or None,
                 "page": page_number,
                 "evidence": evidence,
                 "confidence": confidence,
@@ -903,11 +882,20 @@ def sanitize_well_extraction(
         )
 
     conflicts: list[dict[str, Any]] = []
+    valid_conflict_types = {
+        "ocr_error",
+        "possible_document_inconsistency",
+        "possible_rounding",
+        "technical_stage_difference",
+        "temporal_change",
+        "unresolved",
+    }
     for index, raw_conflict in enumerate(raw_result["conflicts"], start=1):
         if not isinstance(raw_conflict, dict):
             local_warnings.append(f"Удалён невалидный conflicts[{index}].")
             continue
         parameter = str(raw_conflict.get("parameter") or "").strip()
+        conflict_type = str(raw_conflict.get("conflict_type") or "").strip()
         raw_value = str(raw_conflict.get("raw_value") or "").strip()
         evidence = str(raw_conflict.get("evidence") or "").strip()
         reason = str(raw_conflict.get("reason") or "").strip()
@@ -915,12 +903,19 @@ def sanitize_well_extraction(
             page_number = int(raw_conflict.get("page"))
         except (TypeError, ValueError):
             page_number = -1
+        page_key = _resolve_evidence_page(
+            raw_conflict.get("file"),
+            page_number,
+            evidence,
+            search_texts,
+        )
         if (
             parameter not in valid_parameters
+            or conflict_type not in valid_conflict_types
             or not raw_value
             or not reason
             or len(evidence) > 300
-            or not _literal_exists_on_page(evidence, page_number, search_texts)
+            or page_key is None
             or _normalized_literal(raw_value) not in _normalized_literal(evidence)
         ):
             local_warnings.append(
@@ -930,7 +925,9 @@ def sanitize_well_extraction(
         conflicts.append(
             {
                 "parameter": parameter,
+                "conflict_type": conflict_type,
                 "raw_value": raw_value,
+                "file": page_key[0] or None,
                 "page": page_number,
                 "evidence": evidence,
                 "reason": reason,

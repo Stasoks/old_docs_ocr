@@ -24,12 +24,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -574,12 +576,212 @@ def resize_long_side(image: Image.Image, max_size: int) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 
+def _json_compatible(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_compatible(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return _json_compatible(vars(value))
+    return str(value)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def convert_rfdetr_checkpoint_to_safetensors(
+    source_path: Path,
+    destination_path: Path,
+    overwrite: bool = False,
+    verify: bool = True,
+) -> Path:
+    """Convert a trusted RF-DETR PTH checkpoint into a tensor-only file."""
+
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    source_path = source_path.expanduser()
+    destination_path = destination_path.expanduser()
+    source_filename = source_path.name
+    if source_path.suffix.lower() not in {".pth", ".pt"}:
+        raise ValueError("Исходный RF-DETR checkpoint должен быть .pth или .pt.")
+    if destination_path.suffix.lower() != ".safetensors":
+        raise ValueError("Итоговый RF-DETR checkpoint должен быть .safetensors.")
+    source_path = source_path.resolve()
+    destination_path = destination_path.resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Не найден PTH checkpoint: {source_path}")
+    if destination_path.exists() and not overwrite:
+        return destination_path
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # This conversion intentionally accepts only a trusted local/Hugging Face
+    # checkpoint. weights_only=False is required for its argparse.Namespace.
+    checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or not isinstance(
+        checkpoint.get("model"), dict
+    ):
+        raise ValueError("RF-DETR checkpoint должен содержать tensor map в model.")
+    raw_state_dict = checkpoint["model"]
+    non_tensors = [
+        name
+        for name, value in raw_state_dict.items()
+        if not isinstance(value, torch.Tensor)
+    ]
+    if non_tensors:
+        raise TypeError(
+            "В model найдены значения, не являющиеся tensors: "
+            + ", ".join(non_tensors[:10])
+        )
+
+    state_dict = {
+        str(name): tensor.detach().cpu().contiguous().clone()
+        for name, tensor in raw_state_dict.items()
+    }
+    checkpoint_args = _json_compatible(checkpoint.get("args", {}))
+    metadata = {
+        "format": "rfdetr_state_dict_v1",
+        "source_filename": source_filename,
+        "source_sha256": _file_sha256(source_path),
+        "checkpoint_args": json.dumps(
+            checkpoint_args,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "tensor_count": str(len(state_dict)),
+    }
+
+    with tempfile.NamedTemporaryFile(
+        dir=destination_path.parent,
+        prefix=destination_path.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        save_file(state_dict, temporary_path, metadata=metadata)
+        if verify:
+            with safe_open(temporary_path, framework="pt", device="cpu") as converted:
+                if set(converted.keys()) != set(state_dict):
+                    raise RuntimeError("Набор tensor keys изменился после конвертации.")
+                for name, expected in state_dict.items():
+                    actual = converted.get_tensor(name)
+                    if actual.dtype != expected.dtype or actual.shape != expected.shape:
+                        raise RuntimeError(f"Shape/dtype не совпали для {name}.")
+                    if not torch.equal(actual, expected):
+                        raise RuntimeError(f"Tensor {name} изменился при конвертации.")
+        temporary_path.replace(destination_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return destination_path
+
+
+def _default_safetensors_path(source_path: Path) -> Path:
+    resolved_source = source_path.resolve()
+    if re.fullmatch(r"[0-9a-f]{40,64}", resolved_source.name):
+        source_identity = resolved_source.name[:16]
+    else:
+        source_identity = _file_sha256(resolved_source)[:16]
+    return (
+        Path.home()
+        / ".cache"
+        / "qwen_ocr"
+        / "weights"
+        / f"{source_path.stem}-{source_identity}.safetensors"
+    )
+
+
+def ensure_rfdetr_safetensors(
+    source_path: Path,
+    destination_path: Path | None = None,
+) -> Path:
+    if source_path.suffix.lower() == ".safetensors":
+        return source_path.expanduser().resolve()
+    destination = destination_path or _default_safetensors_path(source_path)
+    if destination.is_file():
+        return destination
+    log(f"Конвертация RF-DETR в safetensors: {destination}")
+    return convert_rfdetr_checkpoint_to_safetensors(
+        source_path,
+        destination,
+        verify=True,
+    )
+
+
+def load_rfdetr_safetensors(weights: Path, cpu: bool = False) -> Any:
+    import torch
+    from rfdetr import RFDETRSegPreview
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    with safe_open(weights, framework="pt", device="cpu") as checkpoint_file:
+        metadata = checkpoint_file.metadata() or {}
+    if metadata.get("format") != "rfdetr_state_dict_v1":
+        raise ValueError(
+            "Неизвестный safetensors format. Ожидается rfdetr_state_dict_v1."
+        )
+    checkpoint_args = json.loads(metadata.get("checkpoint_args", "{}"))
+    if checkpoint_args.get("segmentation_head") is not True:
+        raise ValueError("Checkpoint не является RF-DETR segmentation model.")
+    if checkpoint_args.get("patch_size") not in {None, 12}:
+        raise ValueError("Checkpoint несовместим с RFDETRSegPreview patch_size=12.")
+
+    model_kwargs: dict[str, Any] = {"pretrain_weights": None}
+    if cpu:
+        model_kwargs["device"] = "cpu"
+    model = RFDETRSegPreview(**model_kwargs)
+    state_dict = load_file(weights, device="cpu")
+    if "class_embed.bias" not in state_dict:
+        raise KeyError("В safetensors отсутствует class_embed.bias.")
+
+    model_context = model.model
+    raw_model = model_context.model
+    checkpoint_num_classes = int(state_dict["class_embed.bias"].shape[0])
+    if checkpoint_num_classes != model_context.args.num_classes + 1:
+        raw_model.reinitialize_detection_head(checkpoint_num_classes)
+
+    num_desired_queries = model_context.args.num_queries * model_context.args.group_detr
+    for name in list(state_dict):
+        if name.endswith(("refpoint_embed.weight", "query_feat.weight")):
+            state_dict[name] = state_dict[name][:num_desired_queries]
+
+    incompatible = raw_model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        warn(
+            "RF-DETR safetensors загружен с несовпадающими keys: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    class_names = checkpoint_args.get("class_names")
+    if isinstance(class_names, list):
+        model_context.class_names = [str(name) for name in class_names]
+    del state_dict
+    if cpu:
+        raw_model.to(torch.device("cpu"))
+    return model
+
+
 def resolve_detector_weights(args: argparse.Namespace) -> Path:
     if args.detector_weights:
-        path = Path(args.detector_weights).expanduser().resolve()
-        if not path.exists():
+        path = Path(args.detector_weights).expanduser()
+        if not path.is_file():
             raise FileNotFoundError(f"Не найден detector checkpoint: {path}")
-        return path
+        if path.suffix.lower() in {".pth", ".pt"}:
+            return ensure_rfdetr_safetensors(path)
+        if path.suffix.lower() != ".safetensors":
+            raise ValueError("Detector weights должны быть .pth, .pt или .safetensors.")
+        return path.resolve()
 
     from huggingface_hub import hf_hub_download
 
@@ -587,17 +789,26 @@ def resolve_detector_weights(args: argparse.Namespace) -> Path:
         "Скачивание/поиск detector checkpoint: "
         f"{args.detector_repo}/{args.detector_filename}"
     )
-    return Path(
+    source_path = Path(
         hf_hub_download(
             repo_id=args.detector_repo,
             filename=args.detector_filename,
         )
     )
+    return ensure_rfdetr_safetensors(source_path)
 
 
 def load_detector(weights: Path, cpu: bool = False) -> Any:
     if cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if weights.suffix.lower() == ".safetensors":
+        log(f"Загрузка RF-DETR safetensors: {weights}")
+        model = load_rfdetr_safetensors(weights, cpu=cpu)
+        try:
+            model.optimize_for_inference()
+        except Exception as error:
+            warn(f"optimize_for_inference не сработал, продолжаю без него: {error}")
+        return model
     try:
         from rfdetr import RFDETRSegPreview
     except ImportError as error:
