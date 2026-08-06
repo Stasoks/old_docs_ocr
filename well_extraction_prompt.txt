@@ -13,6 +13,8 @@
   "pages": [
     {
       "page": 1,
+      "source_file": "optional/path/inside/archive.pdf",
+      "source_page": 1,
       "blocks": [
         {
           "type": "text | title | subtitle | table",
@@ -519,7 +521,8 @@ raw_value:
 - не исправляй его.
 
 file:
-- имя исходного документа из source_file;
+- для архивного ввода — имя документа из pages[].source_file;
+- для одиночного ввода — имя исходного документа из корневого source_file;
 - используй только последнюю часть пути;
 - если source_file отсутствует, используй document_name из пользовательского сообщения;
 - только если оба отсутствуют, используй null.

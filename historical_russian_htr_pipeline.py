@@ -3,7 +3,7 @@
 Полный локальный HTR-пайплайн для русских исторических документов.
 
 Этапы:
-1. PDF -> изображения страниц.
+1. PDF/JPEG/TIFF -> изображения страниц.
 2. Deskew и безопасная прямоугольная обрезка внешних полей.
 3. Деление страницы на перекрывающиеся горизонтальные тайлы.
 4. RF-DETR: детекция/сегментация отдельных строк.
@@ -39,13 +39,25 @@ from typing import Any
 import cv2
 import numpy as np
 import pymupdf
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 DEFAULT_DETECTOR_REPO = "Kansallisarkisto/rfdetr_textline_textregion_detection_model"
 DEFAULT_DETECTOR_FILENAME = "rfdetr_text_seg_model_202510.pth"
 DEFAULT_OCR_MODEL = "ATH-MaaS/OvisOCR2"
 DEFAULT_QWEN_MODEL = "qwen/qwen2.5-vl-7b"
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
+
+INPUT_TYPE_PDF = "pdf"
+INPUT_TYPE_JPEG = "jpeg"
+INPUT_TYPE_TIFF = "tiff"
+INPUT_TYPE_IMAGE = "image"
+INPUT_TYPE_ZIP = "zip_archive"
+TIFF_SIGNATURES = (
+    b"II*\x00",
+    b"MM\x00*",
+    b"II+\x00",
+    b"MM\x00+",
+)
 
 OVIS_LINE_OCR_PROMPT = """
 Transcribe every readable character in this single cropped text line from a
@@ -1574,10 +1586,51 @@ def build_page_json(
 # ---------------------------------------------------------------------------
 
 
-def input_page_count(input_path: Path) -> int:
-    if input_path.suffix.lower() == ".pdf":
+def detect_input_file_type(input_path: Path) -> str:
+    """Detect PDF, JPEG and TIFF by content, with a Pillow image fallback."""
+
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Не найден входной файл: {input_path}")
+    with input_path.open("rb") as source:
+        signature = source.read(16)
+
+    if signature.startswith(b"%PDF-"):
+        return INPUT_TYPE_PDF
+    if signature.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return INPUT_TYPE_ZIP
+    if signature.startswith(b"\xff\xd8\xff"):
+        return INPUT_TYPE_JPEG
+    if signature.startswith(TIFF_SIGNATURES):
+        return INPUT_TYPE_TIFF
+
+    try:
+        with Image.open(input_path) as image:
+            image_format = str(image.format or "").upper()
+    except (OSError, UnidentifiedImageError) as error:
+        raise ValueError(
+            "Неподдерживаемый входной файл. Ожидается PDF, JPEG, TIFF "
+            "или изображение, которое может открыть Pillow."
+        ) from error
+
+    if image_format == "JPEG":
+        return INPUT_TYPE_JPEG
+    if image_format in {"TIFF", "TIF"}:
+        return INPUT_TYPE_TIFF
+    return INPUT_TYPE_IMAGE
+
+
+def input_page_count(input_path: Path, input_type: str | None = None) -> int:
+    resolved_type = input_type or detect_input_file_type(input_path)
+    if resolved_type == INPUT_TYPE_ZIP:
+        raise ValueError(
+            "ZIP-архив должен обрабатываться через hybrid_htr_table_pipeline.py."
+        )
+    if resolved_type == INPUT_TYPE_PDF:
         with pymupdf.open(input_path) as document:
             return document.page_count
+    if resolved_type == INPUT_TYPE_TIFF:
+        with Image.open(input_path) as image:
+            return max(1, int(getattr(image, "n_frames", 1)))
     return 1
 
 
@@ -1585,13 +1638,32 @@ def load_input_page(
     input_path: Path,
     page_index: int,
     dpi: int,
+    input_type: str | None = None,
 ) -> Image.Image:
-    if input_path.suffix.lower() == ".pdf":
+    resolved_type = input_type or detect_input_file_type(input_path)
+    if resolved_type == INPUT_TYPE_ZIP:
+        raise ValueError(
+            "ZIP-архив должен обрабатываться через hybrid_htr_table_pipeline.py."
+        )
+    if resolved_type == INPUT_TYPE_PDF:
         with pymupdf.open(input_path) as document:
+            if not 0 <= page_index < document.page_count:
+                raise IndexError(f"В PDF нет страницы с индексом {page_index}.")
             return render_page_image(document[page_index], dpi)
-    if page_index != 0:
-        raise IndexError("Для изображения доступна только первая страница.")
-    return Image.open(input_path).convert("RGB")
+    with Image.open(input_path) as image:
+        frame_count = (
+            max(1, int(getattr(image, "n_frames", 1)))
+            if resolved_type == INPUT_TYPE_TIFF
+            else 1
+        )
+        if not 0 <= page_index < frame_count:
+            raise IndexError(
+                f"Для {resolved_type.upper()} нет страницы с индексом {page_index}."
+            )
+        if resolved_type == INPUT_TYPE_TIFF:
+            image.seek(page_index)
+        rendered = ImageOps.exif_transpose(image)
+        return rendered.convert("RGB")
 
 
 def detect_document_pages(
@@ -1600,7 +1672,9 @@ def detect_document_pages(
     output_root: Path,
     detector: Any,
     args: argparse.Namespace,
+    input_type: str | None = None,
 ) -> list[dict[str, Any]]:
+    resolved_type = input_type or detect_input_file_type(input_path)
     page_manifests: list[dict[str, Any]] = []
 
     for current, page_index in enumerate(page_indices, start=1):
@@ -1614,7 +1688,12 @@ def detect_document_pages(
             tiles_dir.mkdir(parents=True, exist_ok=True)
 
         log(f"[{current}/{len(page_indices)}] Детекция страницы {page_number}")
-        original = load_input_page(input_path, page_index, args.dpi)
+        original = load_input_page(
+            input_path,
+            page_index,
+            args.dpi,
+            input_type=resolved_type,
+        )
         original_size = original.size
 
         if args.no_deskew:
@@ -1703,6 +1782,8 @@ def detect_document_pages(
             )
 
         preprocessing = {
+            "input_type": resolved_type,
+            "source_page_index": page_index,
             "dpi": args.dpi,
             "original_size": list(original_size),
             "deskew_angle": deskew_angle,
@@ -1859,7 +1940,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=("PDF -> RF-DETR line detection -> OvisOCR2 -> structured JSON")
     )
-    parser.add_argument("input", help="PDF или изображение страницы")
+    parser.add_argument("input", help="PDF, JPEG, TIFF или другое изображение")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -1969,6 +2050,7 @@ def main() -> int:
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Не найден входной файл: {input_path}")
+    input_type = detect_input_file_type(input_path)
 
     output_root = (
         Path(args.output_dir).expanduser().resolve()
@@ -1979,9 +2061,10 @@ def main() -> int:
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    page_count = input_page_count(input_path)
+    page_count = input_page_count(input_path, input_type)
     page_indices = parse_page_spec(args.pages, page_count)
     log(f"Вход: {input_path}")
+    log(f"Тип входного файла: {input_type}")
     log(f"Страниц: {page_count}; обрабатывается: {[i + 1 for i in page_indices]}")
     log(f"Результат: {output_root}")
 
@@ -1997,6 +2080,7 @@ def main() -> int:
             output_root=output_root,
             detector=detector,
             args=args,
+            input_type=input_type,
         )
         unload_detector(detector)
 
@@ -2008,6 +2092,7 @@ def main() -> int:
 
     document_json = {
         "source_file": str(input_path),
+        "input_type": input_type,
         "page_count_in_source": page_count,
         "processed_pages": [index + 1 for index in page_indices],
         "pages": pages,

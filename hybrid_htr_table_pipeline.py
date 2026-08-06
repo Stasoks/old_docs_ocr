@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hybrid HTR pipeline for historical documents.
+Hybrid HTR pipeline for historical documents and ZIP collections.
 
 RF-DETR detects text lines and text regions. Large, sufficiently rectangular
 regions are treated as possible tables, deduplicated, and sent once to a VLM
@@ -15,7 +15,7 @@ The resulting well parameters are constrained by a JSON Schema and checked
 against literal evidence on the cited page before they are saved.
 
 The RF-DETR and TrOCR instances are cached in one Python process and remain on
-CUDA until it exits. With --keep-alive, additional PDF/image paths can be
+CUDA until it exits. With --keep-alive, additional PDF/image/ZIP paths can be
 entered without reloading either model. LM Studio receives a long TTL with
 each request so Qwen remains loaded on its side as well.
 """
@@ -29,7 +29,9 @@ import json
 import re
 import shutil
 import sys
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -45,6 +47,9 @@ DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1"
 DEFAULT_EXTRACTION_PROMPT = (
     Path(__file__).resolve().with_name("well_extraction_prompt.txt")
 )
+MAX_ARCHIVE_MEMBERS = 10_000
+MAX_ARCHIVE_MEMBER_BYTES = 2 * 1024**3
+MAX_ARCHIVE_TOTAL_BYTES = 20 * 1024**3
 
 CANONICAL_WELL_PARAMETERS = (
     "Номер скважины",
@@ -642,12 +647,20 @@ def clean_document_for_extraction(
                 block["rows"] = rows
             cleaned_blocks.append(block)
 
-        cleaned_pages.append(
-            {
-                "page": page_number,
-                "blocks": cleaned_blocks,
-            }
-        )
+        cleaned_page: dict[str, Any] = {
+            "page": page_number,
+            "blocks": cleaned_blocks,
+        }
+        page_source = str(raw_page.get("source_file") or "").strip()
+        if page_source:
+            cleaned_page["source_file"] = page_source
+        try:
+            source_page = int(raw_page.get("source_page"))
+        except (TypeError, ValueError):
+            source_page = 0
+        if source_page > 0:
+            cleaned_page["source_page"] = source_page
+        cleaned_pages.append(cleaned_page)
 
     return {
         "source_file": source_file,
@@ -824,6 +837,17 @@ def sanitize_well_extraction(
     valid_parameters = set(CANONICAL_WELL_PARAMETERS)
     source_file = str(cleaned_document.get("source_file", "")).strip()
     expected_file: str | None = source_file or None
+    page_source_files: dict[int, str] = {}
+    for page in cleaned_document.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        try:
+            page_number = int(page.get("page"))
+        except (TypeError, ValueError):
+            continue
+        page_source = str(page.get("source_file") or "").strip()
+        if page_source:
+            page_source_files[page_number] = Path(page_source.replace("\\", "/")).name
     search_texts = _page_search_texts(cleaned_document)
     local_warnings: list[str] = []
     records: list[dict[str, Any]] = []
@@ -870,7 +894,7 @@ def sanitize_well_extraction(
                 "parameter": parameter,
                 "value": value,
                 "raw_value": raw_value,
-                "file": expected_file,
+                "file": page_source_files.get(page_number, expected_file),
                 "page": page_number,
                 "evidence": evidence,
                 "confidence": confidence,
@@ -1850,67 +1874,38 @@ def output_root_for_input(
     return output_parent / input_path.stem
 
 
-def process_input(
-    input_value: str | Path,
+def _document_models(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "line_detector": args.detector_repo,
+        "line_recognizer": args.ocr_model,
+        "region_recognizer": args.qwen_model,
+        "document_extractor": (
+            args.extraction_model if args.extract_well_data else None
+        ),
+    }
+
+
+def _model_residency(args: argparse.Namespace) -> dict[str, str]:
+    return {
+        "detector": "cpu" if args.detector_cpu else "cuda_until_process_exit",
+        "line_recognizer": (
+            "cuda_until_process_exit"
+            if htr.resolve_torch_device(args.ocr_device) == "cuda"
+            else "cpu"
+        ),
+        "region_recognizer": "lm_studio_ttl",
+        "document_extractor": "lm_studio_ttl" if args.extract_well_data else "off",
+    }
+
+
+def finalize_document(
+    output_root: Path,
+    document_json: dict[str, Any],
     pool: CudaModelPool,
     args: argparse.Namespace,
+    started: float,
 ) -> Path:
-    input_path = Path(input_value).expanduser().resolve()
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Не найден входной файл: {input_path}")
-    output_parent = args.output_dir.expanduser().resolve()
-    output_root = output_root_for_input(input_path, output_parent)
-    if output_root.exists() and args.overwrite and not args.skip_detection:
-        shutil.rmtree(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    page_count = htr.input_page_count(input_path)
-    page_indices = htr.parse_page_spec(args.pages, page_count)
-    htr.log(f"Вход: {input_path}")
-    htr.log(f"Страницы: {[index + 1 for index in page_indices]}")
-    htr.log(f"Результат: {output_root}")
-    started = time.time()
-
-    if args.skip_detection:
-        manifests = htr.load_saved_manifests(output_root, page_indices)
-    else:
-        manifests = htr.detect_document_pages(
-            input_path=input_path,
-            page_indices=page_indices,
-            output_root=output_root,
-            detector=pool.get_detector(),
-            args=args,
-        )
-
-    pages = assemble_hybrid_pages(output_root, manifests, pool, args)
-    document_json = {
-        "source_file": str(input_path),
-        "page_count_in_source": page_count,
-        "processed_pages": [index + 1 for index in page_indices],
-        "pages": pages,
-        "models": {
-            "line_detector": args.detector_repo,
-            "line_recognizer": args.ocr_model,
-            "region_recognizer": args.qwen_model,
-            "document_extractor": (
-                args.extraction_model if args.extract_well_data else None
-            ),
-        },
-        "model_residency": {
-            "detector": "cpu" if args.detector_cpu else "cuda_until_process_exit",
-            "line_recognizer": (
-                "cuda_until_process_exit"
-                if htr.resolve_torch_device(args.ocr_device) == "cuda"
-                else "cpu"
-            ),
-            "region_recognizer": "lm_studio_ttl",
-            "document_extractor": (
-                "lm_studio_ttl" if args.extract_well_data else "off"
-            ),
-        },
-        "qwen_lmstudio_ttl_seconds": args.qwen_ttl,
-        "elapsed_seconds": round(time.time() - started, 3),
-    }
+    document_json["elapsed_seconds"] = round(time.time() - started, 3)
     cleaned_document = clean_document_for_extraction(document_json)
     cleaned_path = output_root / "cleaned_document.json"
     htr.save_json_atomic(cleaned_path, cleaned_document)
@@ -1970,9 +1965,278 @@ def process_input(
     return output_root
 
 
+def _archive_member_filename(index: int, member_path: str) -> str:
+    basename = member_path.replace("\\", "/").rsplit("/", 1)[-1]
+    path = Path(basename)
+    stem = re.sub(r"[^\w.-]+", "_", path.stem, flags=re.UNICODE).strip("._")
+    suffix = path.suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+        suffix = ".bin"
+    return f"{index:04d}_{stem or 'member'}{suffix}"
+
+
+def extract_zip_members(
+    archive_path: Path,
+    temporary_root: Path,
+) -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = []
+    with zipfile.ZipFile(archive_path) as archive:
+        file_infos = [info for info in archive.infolist() if not info.is_dir()]
+        if len(file_infos) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError(
+                f"В ZIP слишком много файлов: {len(file_infos)} > "
+                f"{MAX_ARCHIVE_MEMBERS}."
+            )
+        total_size = sum(max(0, info.file_size) for info in file_infos)
+        if total_size > MAX_ARCHIVE_TOTAL_BYTES:
+            raise ValueError(
+                f"Распакованный размер ZIP превышает {MAX_ARCHIVE_TOTAL_BYTES} байт."
+            )
+
+        for index, info in enumerate(file_infos, start=1):
+            member: dict[str, Any] = {
+                "archive_path": info.filename,
+                "size_bytes": int(info.file_size),
+                "compressed_size_bytes": int(info.compress_size),
+                "input_type": None,
+                "temporary_path": None,
+                "error": None,
+            }
+            if info.flag_bits & 0x1:
+                member["error"] = "Зашифрованные элементы ZIP не поддерживаются."
+                members.append(member)
+                continue
+            if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                member["error"] = (
+                    f"Размер элемента превышает {MAX_ARCHIVE_MEMBER_BYTES} байт."
+                )
+                members.append(member)
+                continue
+
+            destination = temporary_root / _archive_member_filename(
+                index, info.filename
+            )
+            try:
+                with archive.open(info) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+                member["temporary_path"] = str(destination)
+                member["input_type"] = htr.detect_input_file_type(destination)
+            except Exception as error:
+                member["error"] = f"{type(error).__name__}: {error}"
+            members.append(member)
+    return members
+
+
+def process_archive(
+    archive_path: Path,
+    pool: CudaModelPool,
+    args: argparse.Namespace,
+) -> Path:
+    output_parent = args.output_dir.expanduser().resolve()
+    output_root = output_root_for_input(archive_path, output_parent)
+    if output_root.exists() and args.overwrite and not args.skip_detection:
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    members_output = output_root / "members"
+    members_output.mkdir(parents=True, exist_ok=True)
+
+    started = time.time()
+    htr.log(f"Вход: {archive_path}")
+    htr.log(f"Тип входного файла: {htr.INPUT_TYPE_ZIP}")
+    htr.log(f"Результат: {output_root}")
+
+    archive_members: list[dict[str, Any]] = []
+    combined_pages: list[dict[str, Any]] = []
+    all_text_parts: list[str] = []
+    source_page_count = 0
+    processed_file_count = 0
+
+    with tempfile.TemporaryDirectory(prefix="hybrid_htr_zip_") as temporary:
+        extracted_members = extract_zip_members(archive_path, Path(temporary))
+        for current, member in enumerate(extracted_members, start=1):
+            archive_member = {
+                "archive_path": member["archive_path"],
+                "input_type": member["input_type"],
+                "size_bytes": member["size_bytes"],
+                "status": "skipped",
+                "page_count": 0,
+                "processed_pages": [],
+                "output_dir": None,
+                "error": member["error"],
+            }
+            input_type = member.get("input_type")
+            temporary_path = member.get("temporary_path")
+            if member.get("error"):
+                htr.warn(f"ZIP {member['archive_path']}: пропущен: {member['error']}")
+                archive_members.append(archive_member)
+                continue
+            if input_type == htr.INPUT_TYPE_ZIP:
+                archive_member["error"] = "Вложенные ZIP-архивы не поддерживаются."
+                htr.warn(f"ZIP {member['archive_path']}: вложенный архив пропущен.")
+                archive_members.append(archive_member)
+                continue
+            if not temporary_path:
+                archive_member["error"] = "Временный файл не создан."
+                archive_members.append(archive_member)
+                continue
+
+            htr.log(
+                f"[{current}/{len(extracted_members)}] ZIP member: "
+                f"{member['archive_path']} ({input_type})"
+            )
+            member_args = argparse.Namespace(**vars(args))
+            member_args.output_dir = members_output
+            member_args.extract_well_data = False
+            member_args.keep_alive = False
+            try:
+                member_output = process_input(temporary_path, pool, member_args)
+                child_document_path = member_output / "document.json"
+                child_document = json.loads(
+                    child_document_path.read_text(encoding="utf-8")
+                )
+                child_document["source_file"] = member["archive_path"]
+                child_document["archive_source"] = archive_path.name
+                child_document_path.unlink()
+                (member_output / "cleaned_document.json").unlink(missing_ok=True)
+
+                member_relative = member_output.relative_to(output_root).as_posix()
+                local_processed_pages = [
+                    int(page) for page in child_document.get("processed_pages", [])
+                ]
+                page_count = int(child_document.get("page_count_in_source", 0))
+                source_page_count += page_count
+                processed_file_count += 1
+                archive_member.update(
+                    {
+                        "status": "ok",
+                        "page_count": page_count,
+                        "processed_pages": local_processed_pages,
+                        "output_dir": member_relative,
+                        "error": None,
+                    }
+                )
+
+                for raw_page in child_document.get("pages", []):
+                    if not isinstance(raw_page, dict):
+                        continue
+                    source_page = int(raw_page.get("page", 0))
+                    global_page_number = len(combined_pages) + 1
+                    page = dict(raw_page)
+                    page.update(
+                        {
+                            "page": global_page_number,
+                            "source_file": member["archive_path"],
+                            "source_page": source_page,
+                            "artifact_root": (
+                                f"{member_relative}/page_{source_page:03d}"
+                            ),
+                        }
+                    )
+                    combined_pages.append(page)
+                    page_text = "\n".join(
+                        str(block.get("content", ""))
+                        for block in page.get("blocks", [])
+                        if isinstance(block, dict)
+                    )
+                    all_text_parts.append(
+                        f"=== PAGE {global_page_number} | "
+                        f"{member['archive_path']}:{source_page} ===\n{page_text}"
+                    )
+            except KeyboardInterrupt:
+                raise
+            except Exception as error:
+                archive_member["status"] = "error"
+                archive_member["error"] = f"{type(error).__name__}: {error}"
+                htr.warn(
+                    f"ZIP {member['archive_path']}: "
+                    f"ошибка обработки: {archive_member['error']}"
+                )
+                if not args.continue_on_error:
+                    archive_members.append(archive_member)
+                    raise
+            archive_members.append(archive_member)
+
+    if not combined_pages:
+        raise RuntimeError("В ZIP не найдено ни одной успешно обработанной страницы.")
+
+    (output_root / "all_text.txt").write_text(
+        "\n\n".join(all_text_parts) + "\n",
+        encoding="utf-8",
+    )
+    document_json = {
+        "source_file": str(archive_path),
+        "input_type": htr.INPUT_TYPE_ZIP,
+        "page_count_in_source": source_page_count,
+        "processed_pages": list(range(1, len(combined_pages) + 1)),
+        "processed_files": processed_file_count,
+        "pages": combined_pages,
+        "archive": {
+            "format": "zip",
+            "member_count": len(archive_members),
+            "processed_member_count": processed_file_count,
+            "members": archive_members,
+        },
+        "models": _document_models(args),
+        "model_residency": _model_residency(args),
+        "qwen_lmstudio_ttl_seconds": args.qwen_ttl,
+    }
+    return finalize_document(output_root, document_json, pool, args, started)
+
+
+def process_input(
+    input_value: str | Path,
+    pool: CudaModelPool,
+    args: argparse.Namespace,
+) -> Path:
+    input_path = Path(input_value).expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Не найден входной файл: {input_path}")
+    input_type = htr.detect_input_file_type(input_path)
+    if input_type == htr.INPUT_TYPE_ZIP:
+        return process_archive(input_path, pool, args)
+    output_parent = args.output_dir.expanduser().resolve()
+    output_root = output_root_for_input(input_path, output_parent)
+    if output_root.exists() and args.overwrite and not args.skip_detection:
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    page_count = htr.input_page_count(input_path, input_type)
+    page_indices = htr.parse_page_spec(args.pages, page_count)
+    htr.log(f"Вход: {input_path}")
+    htr.log(f"Тип входного файла: {input_type}")
+    htr.log(f"Страницы: {[index + 1 for index in page_indices]}")
+    htr.log(f"Результат: {output_root}")
+    started = time.time()
+
+    if args.skip_detection:
+        manifests = htr.load_saved_manifests(output_root, page_indices)
+    else:
+        manifests = htr.detect_document_pages(
+            input_path=input_path,
+            page_indices=page_indices,
+            output_root=output_root,
+            detector=pool.get_detector(),
+            args=args,
+            input_type=input_type,
+        )
+
+    pages = assemble_hybrid_pages(output_root, manifests, pool, args)
+    document_json = {
+        "source_file": str(input_path),
+        "input_type": input_type,
+        "page_count_in_source": page_count,
+        "processed_pages": [index + 1 for index in page_indices],
+        "pages": pages,
+        "models": _document_models(args),
+        "model_residency": _model_residency(args),
+        "qwen_lmstudio_ttl_seconds": args.qwen_ttl,
+    }
+    return finalize_document(output_root, document_json, pool, args, started)
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if not args.inputs and not args.keep_alive:
-        raise ValueError("Укажи хотя бы один PDF/изображение или --keep-alive.")
+        raise ValueError("Укажи хотя бы один PDF/JPEG/TIFF/ZIP или --keep-alive.")
     if args.dpi < 72:
         raise ValueError("--dpi должен быть >= 72.")
     if args.tile_count < 1 or args.ocr_batch_size < 1:
@@ -2020,7 +2284,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Qwen3.6-27B well extraction"
         )
     )
-    parser.add_argument("inputs", nargs="*", help="PDF или изображения")
+    parser.add_argument("inputs", nargs="*", help="PDF, JPEG, TIFF или ZIP")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -2182,7 +2446,7 @@ def main() -> int:
 
     if args.keep_alive:
         htr.log(
-            "\nCUDA models are resident. Enter the next PDF/image path; "
+            "\nCUDA models are resident. Enter the next PDF/JPEG/TIFF/ZIP path; "
             "type 'exit' to finish."
         )
         while True:
